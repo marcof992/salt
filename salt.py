@@ -79,7 +79,10 @@ def walk_caches():
   salt_caches[-1]['name'] = 'slab_caches'
 
   start = gdb.Value(int(slab_caches)-list_offset//8).cast(gdb.lookup_type('struct kmem_cache').pointer())
+  #print(hex(start)) 
   nxt = get_next_cache(start)
+  #print(hex(list_offset//8))
+  #print(hex(nxt))
   salt_caches[-1]['next'] = tohex(int(nxt), 64)
   salt_caches.append(dict())
   while True:
@@ -235,7 +238,6 @@ class kfreeFinishBP(gdb.FinishBreakpoint):
 
   def stop(self):
     rdi = gdb.selected_frame().read_register('rdi') #XXX
-    return False
     if rdi == 0 or rdi == ZERO_SIZE_PTR or rdi == 0x40000000: #XXX
       return False
 
@@ -253,9 +255,23 @@ class kfreeFinishBP(gdb.FinishBreakpoint):
 class kfreeBP(gdb.Breakpoint):
 
   def stop(self):
-    kfreeFinishBP(internal=True)
-    #x = gdb.selected_frame().read_var('x')
-    #trace_info = 'freeing object at address ' + str(x)
+    #kfreeFinishBP(internal=True)
+    rdi = gdb.selected_frame().read_register('rdi') #XXX
+    if rdi == 0 or rdi == ZERO_SIZE_PTR or rdi == 0x40000000: #XXX
+      return False
+    
+    try:
+        cache = rdi.cast(gdb.lookup_type('struct kmem_cache').pointer()).dereference()
+        cache = cache['name'].string()
+
+        name, pid = get_task_info()
+    
+        if apply_filter(name, cache):
+            trace_info = 'kfree is freeing an object from cache ' + cache  + ' on behalf of process "' + name + '", pid ' + str(pid)
+            salt_print(trace_info)
+            history.append(('kfree', cache, name, pid))
+    except:
+        return False
     return False
 
 
@@ -296,7 +312,11 @@ class kmemCacheFreeBP(gdb.Breakpoint):
 class newSlabBP(gdb.Breakpoint):
 
   def stop(self):
-    s = gdb.selected_frame().read_var('s')
+    #s = gdb.selected_frame().read_var('s')
+    rdi = gdb.selected_frame().read_register('rdi') #XXX
+    if rdi == 0 or rdi == ZERO_SIZE_PTR or rdi == 0x40000000: #XXX
+      return False
+    s = rdi.cast(gdb.lookup_type('struct kmem_cache').pointer()).dereference()
     name, pid = get_task_info()
     cache = s['name'].string()
 
