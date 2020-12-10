@@ -327,6 +327,21 @@ class newSlabBP(gdb.Breakpoint):
 
     return False
 
+class kmemCacheAllocTraceBP(gdb.Breakpoint):
+    def stop(self):
+        s = gdb.selected_frame().read_var('s')
+
+        name, pid = get_task_info()
+        cache = s['name'].string()
+
+        if apply_filter(name, cache):
+            trace_info = 'kmem_cache_alloc_trace is accessing cache ' + cache  + ' on behalf of process "' + name + '", pid ' + str(pid)
+            #trace_info += '\nreturning object at address ' + str(tohex(ret, 64))
+            salt_print(trace_info)
+            history.append(('kmem_cache_alloc_trace', cache, name, pid))
+        
+        return False
+
 
 class salt (gdb.Command):
 
@@ -338,6 +353,7 @@ class salt (gdb.Command):
     kmemCacheAllocBP('kmem_cache_alloc', internal=True)
     kmemCacheFreeBP('kmem_cache_free', internal=True)
     newSlabBP('new_slab', internal=True)
+    kmemCacheAllocTraceBP('kmem_cache_alloc_trace',internal=True)
 
   def invoke (self, arg, from_tty):
     if not arg:
