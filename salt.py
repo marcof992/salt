@@ -64,6 +64,26 @@ def get_next_cache(c1):
   c2 = gdb.Value(int(nxt)-list_offset//8).cast(gdb.lookup_type('struct kmem_cache').pointer())
   return c2
 
+def get_field_bitpos(type, member):
+  for field in type.fields():
+      if field.name == member:
+          return field.bitpos
+      if field.type.code in [gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION] :
+          bitpos = get_field_bitpos(field.type, member)
+          if bitpos is not None:
+              return field.bitpos + bitpos
+  return None
+
+def for_each_entry(type, head, member):
+  void_p = gdb.lookup_type("void").pointer()
+  offset = get_field_bitpos(type, member) // 8
+
+  pos = head["next"].dereference()
+  while pos.address != head.address:
+      entry = gdb.Value(pos.address.cast(void_p) - offset)
+      yield entry.cast(type.pointer()).dereference()
+      pos = pos["next"].dereference()
+
 salt_caches = []
 
 def walk_caches():
@@ -79,27 +99,61 @@ def walk_caches():
   salt_caches[-1]['name'] = 'slab_caches'
 
   start = gdb.Value(int(slab_caches)-list_offset//8).cast(gdb.lookup_type('struct kmem_cache').pointer())
-  #print(hex(start)) 
   nxt = get_next_cache(start)
-  #print(hex(list_offset//8))
-  #print(hex(nxt))
   salt_caches[-1]['next'] = tohex(int(nxt), 64)
   salt_caches.append(dict())
   while True:
-    objsize = int(nxt['object_size'])
+    salt_caches[-1]['addr'] = tohex(int(nxt),64)
+    objsize = tohex(int(nxt['object_size']),64)
     salt_caches[-1]['objsize'] = objsize
+    salt_caches[-1]['size'] = tohex(int(nxt['size']),64)
     offset = int(nxt['offset'])
+    oo = int(nxt['oo']['x'])
+    salt_caches[-1]['objperslab'] = tohex(oo&0xffff,64)
+    salt_caches[-1]['pageperslab'] = tohex(2**(oo>>16),64)
     salt_caches[-1]['offset'] = offset
     salt_caches[-1]['name'] = nxt['name'].string()
     cpu_slab_offset = int(nxt['cpu_slab'])
     cpu_slab_ptr = gdb.Value(cpu_slab_offset+cpu0_offset).cast(gdb.lookup_type('struct kmem_cache_cpu').pointer())
     cpu_slab = cpu_slab_ptr.dereference()
-    free = int(cpu_slab['freelist'])
-    salt_caches[-1]['first_free'] = tohex(free, 64)
-    salt_caches[-1]['freelist'] = []
-    while free:
-      free = gdb.Value(free+offset).cast(gdb.lookup_type('uint64_t').pointer()).dereference()
-      salt_caches[-1]['freelist'].append(tohex(int(free), 64))
+    salt_caches[-1]['cpu_slab_ptr'] = int(cpu_slab_ptr)
+    objs,inuse,slabs=0,0,0
+    if cpu_slab["page"] :
+        objs=inuse=int(cpu_slab["page"]["objects"])&0xFFFFFFFF
+        free = int(cpu_slab['freelist'])
+        if free :
+            salt_caches[-1]['first_free'] = tohex(free, 64)
+            salt_caches[-1]['freelist'] = []
+            inuse-=1
+            while free:
+              free = gdb.Value(free+offset).cast(gdb.lookup_type('uint64_t').pointer()).dereference()
+              salt_caches[-1]['freelist'].append(tohex(int(free), 64))
+              inuse -= 1
+        slabs += 1
+
+    if cpu_slab["partial"] :
+        slab = cpu_slab["partial"]
+        salt_caches[-1]['partiallist'] = []
+        if slab :
+            salt_caches[-1]['partiallist'].append(tohex(int(slab),64))
+            while slab :
+                objs += int(slab["objects"])&0xFFFFFFFF
+                inuse += int(slab["inuse"])&0xFFFFFFFF
+                slabs += 1
+                salt_caches[-1]['partiallist'].append(tohex(int(slab),64))
+                slab = slab.dereference()["next"]
+
+    node_cache = nxt["node"].dereference().dereference()
+    page = gdb.lookup_type("struct page")
+    for slab in for_each_entry(page, node_cache["partial"], "lru"):
+        objs += int(slab["objects"]) & 0xFFFFFFFF
+        inuse += int(slab["inuse"]) & 0xFFFFFFFF
+        slabs += 1
+
+    salt_caches[-1]["objs"] = tohex(int(objs),64)
+    salt_caches[-1]["inuse"] = tohex(int(inuse),64)
+    salt_caches[-1]["slabs"] = tohex(int(slabs),64)
+
     nxt = get_next_cache(nxt)
     salt_caches[-1]['next'] = tohex(int(nxt), 64)
     if start == nxt:
@@ -178,13 +232,24 @@ def walk_caches_stdout(targets):
   salt_print(' | ' + ' '*11 + ' v')
   for c in salt_caches[1:]:
     if targets == None or c['name'] in targets:
-      salt_print(' |   name: ' + c['name'])
-      salt_print(' |   first_free: ' + c['first_free'])
-      if len(c['freelist']) > 0:
-        salt_print(' |   freelist:   ' + c['freelist'][0])
-      for f in c['freelist'][1:]:
-        salt_print(' | ' + ' '*14 +  str(f))
-      salt_print(' |   next: ' + c['next'])
+      salt_print(' |   name: ' + c['name'] + '\tobjsize: '+ c['objsize']+'\tsize: '+c['size'])
+      salt_print(' |   objs: ' + c['objs'] + '\t\tinuse: '+ c['inuse']+'\tslabs: '+c['slabs'])
+      salt_print(' |   objperslab:\t' + c['objperslab']+'    pageperslab:\t' + c['pageperslab'])
+      salt_print(' |   addr:\t\t' + c['addr'])
+      salt_print(' |   cpu:\t\t' + hex(c['cpu_slab_ptr']))
+      if 'first_free' in c:
+        salt_print(' |   first_free:\t' + c['first_free'])
+      if ("freelist" in c) and len(c['freelist']) > 0:
+        salt_print(' |   freelist:\t\t' + c['freelist'][0])
+        for f in c['freelist'][1:]:
+            salt_print(' | ' + ' '*11+ '\t\t' +  str(f))
+
+      if ("partiallist" in c) and len(c['partiallist']) > 0:
+        salt_print(' |   partial:\t\t' + c['partiallist'][0])
+        for f in c['partiallist'][1:] :
+            salt_print(' | ' + ' '*11+ '\t\t' +  str(f))
+
+      salt_print(' |   next:\t\t' + c['next'])
       salt_print(' | ' + ' '*11 + ' |')
       if targets != None:
         salt_print(' | ' + ' '*10 + ' ...')
