@@ -1,12 +1,25 @@
-import gdb, json, datetime
+from ast import parse
+import gdb, json, datetime, re, struct
 from string import punctuation
+from packaging import version
 
 #in order to work with per-cpu variables, we need to resolve some addresses
 #assuming we are working on a mono-cpu system, anyways
 cpu0_offset = gdb.lookup_global_symbol('__per_cpu_offset').value()[0]
 current_task_offset = gdb.lookup_global_symbol('current_task').value().address
 current_task_ptr_ptr = cpu0_offset/8 + current_task_offset  #the /8 is to account for pointer arithmetic, <struct task_struct **> has size 8
-
+current_kernel_version = gdb.lookup_global_symbol('linux_banner').value().cast(gdb.lookup_type('char').pointer()).string()
+current_kernel_version = re.match(r'^Linux version ([0-9]*\.[0-9]*\.[0-9]*)', current_kernel_version).group(1)
+current_kernel_version_parsed = version.parse(current_kernel_version)
+freelist_methods = ['default','randxor','randxorswab']
+current_freelist_alg = 'default'
+if current_kernel_version_parsed <= version.parse('4.10.0'):
+  current_freelist_alg = 'default'
+elif current_kernel_version_parsed <= version.parse('5.10.0'):
+  current_freelist_alg = 'randxor'
+else:
+  current_freelist_alg = 'randxorswab'
+  
 filter_on = False
 proc_filter = set()
 cache_filter = set()
@@ -38,6 +51,10 @@ def tohex(val, nbits):
   convenience function to pretty-print hexadecimal numbers as unsigned and on a given amount of bits
   """
   return hex((val + (1 << nbits)) % (1 << nbits))
+
+def swap64(i):
+    return struct.unpack("<Q", struct.pack(">Q", i))[0]
+
 
 def apply_filter(proc, cache):
   """
@@ -107,6 +124,11 @@ def walk_caches():
     objsize = tohex(int(nxt['object_size']),64)
     salt_caches[-1]['objsize'] = objsize
     salt_caches[-1]['size'] = tohex(int(nxt['size']),64)
+    if current_freelist_alg in ['randxor','randxorswab']:
+      free_list_random = int(nxt['random'])
+    else:
+      free_list_random = 0x00
+    salt_caches[-1]['random'] = tohex(free_list_random, 64)
     offset = int(nxt['offset'])
     oo = int(nxt['oo']['x'])
     salt_caches[-1]['objperslab'] = tohex(oo&0xffff,64)
@@ -124,9 +146,25 @@ def walk_caches():
         if free :
             salt_caches[-1]['first_free'] = tohex(free, 64)
             salt_caches[-1]['freelist'] = []
+            salt_caches[-1]['freelistvals'] = []
             inuse-=1
             while free:
-              free = gdb.Value(free+offset).cast(gdb.lookup_type('uint64_t').pointer()).dereference()
+              if current_freelist_alg == 'randxor':
+                free_ptr_addr = free+offset
+                free_ptr_enc = int(gdb.Value(free_ptr_addr).cast(gdb.lookup_type('uint64_t').pointer()).dereference())
+                free_addr = free_ptr_addr ^ free_list_random ^ free_ptr_enc 
+                # print(f"free_ptr_addr: {hex(free_ptr_addr)}, free_ptr_enc: {hex(free_ptr_enc)}, free_addr: {hex(free_addr)}")
+                free = gdb.Value(free_addr)
+                salt_caches[-1]['freelistvals'].append(tohex(free_ptr_enc,64))
+              elif current_freelist_alg == 'randxorswab':
+                free_ptr_addr = free+offset
+                free_ptr_enc = int(gdb.Value(free_ptr_addr).cast(gdb.lookup_type('uint64_t').pointer()).dereference())
+                free_addr = swap64(free_ptr_addr) ^ free_list_random ^ free_ptr_enc 
+                # print(f"free_ptr_addr: {hex(free_ptr_addr)} , free_ptr_enc: {hex(free_ptr_enc)} , free_addr: {hex(free_addr)}, free_output: {tohex(int(gdb.Value(free_addr)),64)}")
+                free = gdb.Value(free_addr)
+                salt_caches[-1]['freelistvals'].append(tohex(free_ptr_enc,64))
+              else:
+                free = gdb.Value(free+offset).cast(gdb.lookup_type('uint64_t').pointer()).dereference()
               salt_caches[-1]['freelist'].append(tohex(int(free), 64))
               inuse -= 1
         slabs += 1
@@ -236,6 +274,7 @@ def walk_caches_stdout(targets):
       salt_print(' |   objs: ' + c['objs'] + '\t\tinuse: '+ c['inuse']+'\tslabs: '+c['slabs'])
       salt_print(' |   objperslab:\t' + c['objperslab']+'    pageperslab:\t' + c['pageperslab'])
       salt_print(' |   addr:\t\t' + c['addr'])
+      salt_print(' |   rand:\t\t' + c['random'])
       salt_print(' |   cpu:\t\t' + hex(c['cpu_slab_ptr']))
       if 'first_free' in c:
         salt_print(' |   first_free:\t' + c['first_free'])
