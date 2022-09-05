@@ -7,6 +7,7 @@ from packaging import version
 #assuming we are working on a mono-cpu system, anyways
 cpu0_offset = gdb.lookup_global_symbol('__per_cpu_offset').value()[0]
 current_task_offset = gdb.lookup_global_symbol('current_task').value().address
+
 current_task_ptr_ptr = cpu0_offset/8 + current_task_offset  #the /8 is to account for pointer arithmetic, <struct task_struct **> has size 8
 current_kernel_version = gdb.lookup_global_symbol('linux_banner').value().cast(gdb.lookup_type('char').pointer()).string()
 current_kernel_version = re.match(r'^Linux version ([0-9]*\.[0-9]*\.[0-9]*)', current_kernel_version).group(1)
@@ -334,6 +335,8 @@ class kmallocBP(gdb.Breakpoint):
   def stop(self):
     global flag
     flag = 1
+    print("triggered")
+    return False
     #kmallocSlabBP('kmalloc_slab', internal=True, temporary=True)
 
 
@@ -462,17 +465,22 @@ class kmemCacheAllocNodeBP(gdb.Breakpoint):
         return False
 
 class salt (gdb.Command):
+  
+  breakpoints = {}
+  breakpoints['kmalloc'] = {'obj': kmallocBP, 'symbol':'__kmalloc', 'set': False, 'instance': None}
+  breakpoints['kmallocslab'] = {'obj': kmallocSlabBP, 'symbol':'kmalloc_slab', 'set': False, 'instance': None}
+  breakpoints['kfree'] = {'obj': kfreeBP, 'symbol':'kfree', 'set': False, 'instance': None}
+  breakpoints['kmemcachealloc'] = {'obj': kmemCacheAllocBP, 'symbol':'kmem_cache_alloc', 'set': False, 'instance': None}
+  breakpoints['kmemcachefree'] = {'obj': kmemCacheFreeBP, 'symbol':'kmem_cache_free', 'set': False, 'instance': None}
+  breakpoints['newslab'] = {'obj': newSlabBP, 'symbol':'new_slab', 'set': False, 'instance': None}
+  breakpoints['kmemcachealloctrace'] = {'obj': kmemCacheAllocTraceBP, 'symbol':'kmem_cache_alloc_trace', 'set': False, 'instance': None}
+  breakpoints['kmemcacheallocnode'] = {'obj': kmemCacheAllocNodeBP, 'symbol':'kmem_cache_alloc_node', 'set': False, 'instance': None}
 
   def __init__ (self):
     super (salt, self).__init__ ("salt", gdb.COMMAND_USER)
-    kmallocBP('__kmalloc', internal=True)
-    kmallocSlabBP('kmalloc_slab', internal=True)
-    kfreeBP('kfree')
-    kmemCacheAllocBP('kmem_cache_alloc', internal=True)
-    kmemCacheFreeBP('kmem_cache_free', internal=True)
-    newSlabBP('new_slab', internal=True)
-    kmemCacheAllocTraceBP('kmem_cache_alloc_trace',internal=True)
-    kmemCacheAllocNodeBP('kmem_cache_alloc_node',internal=True)
+    # for bp in self.breakpoints.keys():
+    #   self.breakpoints[bp]['instance'] = self.breakpoints[bp]['obj'](self.breakpoints[bp]['symbol'], internal=False)
+    #   self.breakpoints[bp]['set']= True
 
   def invoke (self, arg, from_tty):
     if not arg:
@@ -634,9 +642,68 @@ class salt (gdb.Command):
           walk_caches_json(args[1:])
         else:
           walk_caches_json(None)
+          
+      elif args[0] == 'breakpoints':
+        if len(args)<2:
+          print('Missing option. Valid arguments are: enable, disable, set, delete, status')
+        else:
+          if args[1] in ['enable','disable','set','delete','status']:
+            if len(args)<3:
+              print(f"Missing option. Valid arguments are: all, {', '.join(self.breakpoints.keys())}")
+            else:
+              invalid_bp_arg = False
+              for barg in args[2:]:
+                if barg not in self.breakpoints.keys() and barg != 'all':
+                  print(f"Invalid option `{barg}`. Valid arguments are: all, {', '.join(self.breakpoints.keys())}")
+                  invalid_bp_arg = True
+                  break
+              if not invalid_bp_arg:
+                for bp in self.breakpoints.keys():
+                  if self.breakpoints[bp]['set'] == True and not self.breakpoints[bp]['instance'].is_valid():
+                    ## Someone deleted the BP manually
+                    self.breakpoints[bp]['set'] = False
+                for bp in self.breakpoints.keys():
+                  if bp in args[2:] or 'all' in args[2:]:
+                    if args[1] == 'enable':
+                      if self.breakpoints[bp]['set'] == True:
+                        self.breakpoints[bp]['instance'].enabled = True
+                      else:
+                        print(f"Invalid action. Breakpoint {bp} not set. Create it with: `salt breakpoints set {bp}`")
+                    elif args[1] == 'disable':
+                      if self.breakpoints[bp]['set'] == True:
+                        self.breakpoints[bp]['instance'].enabled = False
+                      else:
+                        print(f"Invalid action. Breakpoint {bp} not set. Create it with: `salt breakpoints set {bp}`")
+                    elif args[1] == 'set':
+                      if self.breakpoints[bp]['set'] == True:
+                        print(f"Breakpoint {bp} is already set")
+                      else:
+                        self.breakpoints[bp]['instance'] = self.breakpoints[bp]['obj'](self.breakpoints[bp]['symbol'], internal=False)
+                        self.breakpoints[bp]['set'] = True
+                    elif args[1] == 'delete':
+                      if self.breakpoints[bp]['set'] == True:
+                        self.breakpoints[bp]['instance'].delete()
+                        self.breakpoints[bp]['set'] = False
+                      else:
+                        print(f"Breakpoint {bp} was already deleted")
+                for bp in self.breakpoints.keys():
+                  if bp in args[2:] or 'all' in args[2:]:
+                    if self.breakpoints[bp]['set'] == True:
+                      print(f"{bp}: {'enabled' if self.breakpoints[bp]['instance'].enabled else 'disabled'}")
+                    else:
+                      print(f"{bp}: deleted") 
+          else:
+            print('Invalid option. Valid arguments are: enable, disable, set, delete, status')
 
       elif args[0] == 'help':
         print('Possible commands:')
+        print('\nbreakpoints -- manage breakpoints specifying <bp name>')
+        print('       Available breakpoints: [{}]. Use `all` to apply to entire set'.format(','.join(self.breakpoints.keys())))
+        print('       enable <bp name> -- enable breakpoint.')
+        print('       disable <bp name> -- disable breakpoint.')
+        print('       set <bp name> -- set specified breakpoint')
+        print('       delete <bp name> -- delete specified breakpoint')
+        print('       status <bp name> -- remove one or more filtering conditions')
         print('\nfilter -- manage filtering features by adding with one of the following arguments')
         print('       enable -- enable filtering. Only information about filtered processes will be displayed')
         print('       disable -- disable filtering. Information about all processes will be displayed.')
@@ -663,12 +730,13 @@ class salt (gdb.Command):
 
   def complete(self, text, word):
     ret = []
+    splitted = text.split()
     if text == word:
-      for w in ['filter', 'record', 'logging', 'trace', 'walk', 'walk_html', 'walk_json', 'help']:
+      for w in ['filter', 'record', 'logging', 'trace', 'walk', 'walk_html', 'walk_json', 'help', 'breakpoints']:
         if word == w[:len(word)]:
           ret.append(w)
 
-    else:
+    elif (len(splitted) == 2 and word != '') or (len(splitted)==1 and word == ''):
       comm = text.split()[0]
       if comm == 'filter':
         if len(text.split())==1 or text.split()[1] not in ['enable', 'disable', 'status', 'add', 'remove', 'set']:
@@ -688,7 +756,21 @@ class salt (gdb.Command):
         for w in ['on', 'off', 'show', 'clear']:
           if word == w[:len(word)]:
             ret.append(w)
-
+      
+      elif comm == 'breakpoints':
+        for w in ['enable', 'disable', 'set', 'delete', 'status']:
+          if word == w[:len(word)]:
+            ret.append(w)
+    
+    elif (len(splitted) >= 3) or (len(splitted)==2 and word == ''):
+      comm = splitted[0]
+      commarg = splitted[1]
+            
+      if comm == 'breakpoints':
+        for w in list(self.breakpoints.keys()) + ['all']:
+          if word == w[:len(word)]:
+            ret.append(w)
+          
     return ret
 
 salt()
